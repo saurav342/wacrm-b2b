@@ -68,6 +68,14 @@ const APP_LOCALE = ["en", "pt", "es", "ko"].includes(process.env.NEXT_PUBLIC_APP
   : "en";
 
 const nextConfig: NextConfig = {
+  serverExternalPackages: ["tesseract.js", "@tesseract.js-data/eng"],
+  outputFileTracingIncludes: {
+    "/api/whatsapp/webhook": [
+      "./node_modules/tesseract.js/src/**/*",
+      "./node_modules/tesseract.js-core/**/*",
+      "./node_modules/@tesseract.js-data/eng/**/*",
+    ],
+  },
   turbopack: {
     resolveAlias: {
       "@app-messages": `./messages/${APP_LOCALE}.json`,
@@ -95,6 +103,7 @@ const nextConfig: NextConfig = {
    */
   allowedDevOrigins: [
     "*.ngrok-free.app",
+    "*.ngrok-free.dev",
     "*.ngrok.app",
     "*.ngrok.io",
     "*.trycloudflare.com",

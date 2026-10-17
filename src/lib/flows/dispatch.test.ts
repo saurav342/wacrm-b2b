@@ -97,6 +97,8 @@ vi.mock("./meta-send", () => ({
 
 import { dispatchInboundToFlows, entryTriggerTexts } from "./engine";
 import type { ParsedInbound } from "./types";
+import { B2B_DOCUMENT_INTAKE } from "./b2b-intake-template";
+import { engineSendInteractiveButtons } from "./meta-send";
 
 const KEYWORD_FLOW = {
   id: "flow-1",
@@ -148,6 +150,20 @@ function dispatch(message: ParsedInbound) {
 function startedRuns() {
   return h.state.inserted.filter((i) => i.table === "flow_runs");
 }
+
+describe("B2B greeting entry", () => {
+  it.each(["hi", "hello", "HI", " Hello\n"])("starts the menu for %s", async greeting => {
+    h.state.flows = [{ ...KEYWORD_FLOW, ...B2B_DOCUMENT_INTAKE, status: "active" }];
+    h.state.nodes = B2B_DOCUMENT_INTAKE.nodes.map((node, index) => ({
+      ...node, id: `node-${index}`, flow_id: "flow-1",
+    }));
+    expect(await dispatch({ kind: "text", text: greeting, meta_message_id: "greeting-1" })).toMatchObject({ consumed: true, outcome: "started" });
+    expect(startedRuns()).toHaveLength(1);
+    expect(engineSendInteractiveButtons).toHaveBeenCalledWith(expect.objectContaining({
+      buttons: expect.arrayContaining([expect.objectContaining({ id: "b2b_new_quote", title: "New Quote" })]),
+    }));
+  });
+});
 
 beforeEach(() => {
   // No run in progress — the whole point is the entry-trigger path.

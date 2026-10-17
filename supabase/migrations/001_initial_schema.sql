@@ -5,7 +5,15 @@
 -- ============================================================
 
 -- Enable UUID extension
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA extensions;
+
+-- On hosted Supabase, extensions live in the `extensions` schema which is not on the search_path.
+-- Provide a public wrapper using built-in gen_random_uuid().
+CREATE OR REPLACE FUNCTION public.uuid_generate_v4()
+RETURNS uuid
+LANGUAGE sql
+PARALLEL SAFE
+AS $$ SELECT gen_random_uuid(); $$;
 
 -- ============================================================
 -- PROFILES

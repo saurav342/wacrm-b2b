@@ -85,6 +85,13 @@ vi.mock("./meta-send", () => ({
   engineSendInteractiveList: h.sendList,
 }));
 
+vi.mock("./rc-extraction", () => ({
+  extractRcDetails: vi.fn(async () => ({
+    vehicleDetails: { regNumberParts: ["AN", "01", "J", "8844"] },
+    rc_ocr: { status: "extracted", needs_review: true },
+  })),
+}));
+
 import {
   dispatchInboundToFlows,
   matchReplyId,
@@ -210,6 +217,17 @@ describe("matchesKeywordTrigger", () => {
     expect(matchesKeywordTrigger("help", cfg)).toBe(true);
     expect(matchesKeywordTrigger("HELP", cfg)).toBe(true);
     expect(matchesKeywordTrigger("help me", cfg)).toBe(false);
+  });
+
+  it("accepts greeting whitespace without matching longer phrases", () => {
+    const cfg = {
+      keywords: ["hi", " hello ", "   "],
+      match_type: "exact" as const,
+    };
+    expect(matchesKeywordTrigger("  HI\n", cfg)).toBe(true);
+    expect(matchesKeywordTrigger(" hello ", cfg)).toBe(true);
+    expect(matchesKeywordTrigger("hi there", cfg)).toBe(false);
+    expect(matchesKeywordTrigger("   ", cfg)).toBe(false);
   });
 
   it("case_sensitive=true preserves case", () => {
@@ -447,7 +465,11 @@ const BUTTONS_NODE = {
       // A reply_id is a routing key, not customer-visible text; it must
       // reach Meta exactly as authored even if it happens to look like a
       // template.
-      { reply_id: "no_{{vars.name}}", title: "No thanks", next_node_key: "done" },
+      {
+        reply_id: "no_{{vars.name}}",
+        title: "No thanks",
+        next_node_key: "done",
+      },
     ],
   },
 };
@@ -496,7 +518,13 @@ function nodesEndingIn(next: "choose" | "pick") {
     },
     BUTTONS_NODE,
     LIST_NODE,
-    { id: "n9", flow_id: "flow-1", node_key: "done", node_type: "end", config: {} },
+    {
+      id: "n9",
+      flow_id: "flow-1",
+      node_key: "done",
+      node_type: "end",
+      config: {},
+    },
   ];
 }
 
@@ -522,6 +550,31 @@ describe("send_buttons / send_list interpolate {{vars.*}} (#553)", () => {
     h.state.nodes = nodesEndingIn("choose");
     h.state.events = [];
     h.state.updates = [];
+  });
+
+  it("records an actionable expired-token error when the menu cannot be sent", async () => {
+    h.sendButtons.mockRejectedValueOnce(
+      Object.assign(new Error("Authentication Error"), {
+        code: 190,
+        subcode: 463,
+        httpStatus: 401,
+      }),
+    );
+    expect(await dispatch(text("Alice"))).toMatchObject({
+      consumed: true,
+      outcome: "completed",
+    });
+    expect(h.state.events).toContainEqual(
+      expect.objectContaining({
+        event_type: "error",
+        payload: expect.objectContaining({
+          reason: "send_buttons_failed",
+          meta_code: 190,
+          meta_subcode: 463,
+          detail: expect.stringContaining("access token has expired"),
+        }),
+      }),
+    );
   });
 
   it("send_buttons after collect_input renders body, header and button titles", async () => {
@@ -562,7 +615,11 @@ describe("send_buttons / send_list interpolate {{vars.*}} (#553)", () => {
       {
         title: "Plans for Alice",
         rows: [
-          { id: "basic", title: "Basic for Alice", description: "Best for Alice" },
+          {
+            id: "basic",
+            title: "Basic for Alice",
+            description: "Best for Alice",
+          },
           { id: "pro", title: "Pro", description: undefined },
         ],
       },
@@ -629,43 +686,321 @@ describe("send_buttons / send_list interpolate {{vars.*}} (#553)", () => {
 // Exercise media through the real dispatcher, including fallback and handoff.
 import { B2B_DOCUMENT_INTAKE } from "./b2b-intake-template";
 import { engineSendText } from "./meta-send";
+import { extractRcDetails } from "./rc-extraction";
 
 describe("B2B document intake", () => {
   beforeEach(() => {
     h.state.activeRuns = [{ ...RUN, current_node_key: "collect_rc", vars: {} }];
     h.state.flows = [{ ...FLOW, ...B2B_DOCUMENT_INTAKE }];
-    h.state.nodes = B2B_DOCUMENT_INTAKE.nodes.map((n, i) => ({ ...n, id: `b2b-${i}`, flow_id: "flow-1" }));
+    h.state.nodes = B2B_DOCUMENT_INTAKE.nodes.map((n, i) => ({
+      ...n,
+      id: `b2b-${i}`,
+      flow_id: "flow-1",
+    }));
     h.state.events = [];
     h.state.updates = [];
   });
 
   const rc: ParsedInbound = {
-    kind: "media", media_type: "image", mime_type: "image/jpeg", media_id: "media-1",
-    media_url: "/api/whatsapp/media/media-1", meta_message_id: "wamid.rc",
+    kind: "media",
+    media_type: "image",
+    mime_type: "image/jpeg",
+    media_id: "media-1",
+    media_url: "/api/whatsapp/media/media-1",
+    meta_message_id: "wamid.rc",
   };
 
-  it.each([rc, { ...rc, media_type: "document" as const, mime_type: "application/pdf", filename: "RC.pdf" }])("confirms accepted RC and hands the conversation to the team", async (message) => {
-    expect(await dispatch(message)).toMatchObject({ consumed: true, outcome: "handed_off" });
-    expect(h.state.updates).toContainEqual(expect.objectContaining({ table: "flow_runs", row: expect.objectContaining({ vars: { rc_document: expect.objectContaining({ media_id: "media-1" }) } }) }));
-    expect(engineSendText).toHaveBeenCalledWith(expect.objectContaining({ text: expect.stringContaining("RC document mil gaya") }));
-    expect(h.state.updates).toContainEqual(expect.objectContaining({ table: "conversations", row: expect.objectContaining({ status: "pending" }) }));
+  it.each([
+    rc,
+    {
+      ...rc,
+      media_type: "document" as const,
+      mime_type: "application/pdf",
+      filename: "RC.pdf",
+    },
+  ])(
+    "waits for confirmation before handing the conversation to the team",
+    async (message) => {
+      expect(await dispatch(message)).toMatchObject({
+        consumed: true,
+        outcome: "advanced",
+      });
+      expect(h.state.updates).toContainEqual(
+        expect.objectContaining({
+          table: "flow_runs",
+          row: expect.objectContaining({
+            vars: expect.objectContaining({
+              rc_document: expect.objectContaining({ media_id: "media-1" }),
+              vehicleDetails: expect.objectContaining({
+                regNumberParts: ["AN", "01", "J", "8844"],
+              }),
+            }),
+          }),
+        }),
+      );
+      expect(engineSendText).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          text: expect.stringContaining("RC document mil gaya"),
+        }),
+      );
+      const prompt = h.sendButtons.mock.calls.at(-1)![0];
+      expect(prompt.bodyText).toContain("AN 01 J 8844");
+      expect(
+        await dispatch({
+          kind: "interactive_reply",
+          reply_title: "",
+          reply_id: prompt.buttons[0].id,
+          meta_message_id: "confirmed",
+        }),
+      ).toMatchObject({ outcome: "handed_off" });
+      expect(engineSendText).toHaveBeenCalledWith(
+        expect.objectContaining({
+          text: expect.stringContaining("RC document mil gaya"),
+        }),
+      );
+      expect(h.state.updates).toContainEqual(
+        expect.objectContaining({
+          table: "conversations",
+          row: expect.objectContaining({ status: "pending" }),
+        }),
+      );
+    },
+  );
+
+  it.each([
+    text("RC uploaded"),
+    { ...rc, media_url: null },
+    { ...rc, mime_type: "application/msword" },
+  ])("reprompts invalid input without confirming receipt", async (message) => {
+    expect(await dispatch(message)).toMatchObject({
+      consumed: true,
+      outcome: "fallback_fired",
+    });
+    expect(engineSendText).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("RC document mil gaya"),
+      }),
+    );
+    expect(h.state.updates.some((u) => u.row.vars)).toBe(false);
   });
 
-  it.each([text("RC uploaded"), { ...rc, media_url: null }, { ...rc, mime_type: "application/msword" }])("reprompts invalid input without confirming receipt", async (message) => {
-    expect(await dispatch(message)).toMatchObject({ consumed: true, outcome: "fallback_fired" });
-    expect(engineSendText).not.toHaveBeenCalledWith(expect.objectContaining({ text: expect.stringContaining("RC document mil gaya") }));
-    expect(h.state.updates.some(u => u.row.vars)).toBe(false);
+  it("keeps the attachment and requests a typed number when OCR cannot read it", async () => {
+    vi.mocked(extractRcDetails).mockResolvedValueOnce({
+      vehicleDetails: null,
+      rc_ocr: { status: "failed", needs_review: true },
+    });
+    expect(await dispatch(rc)).toMatchObject({ outcome: "advanced" });
+    expect(h.state.updates).toContainEqual(
+      expect.objectContaining({
+        table: "flow_runs",
+        row: expect.objectContaining({
+          vars: expect.objectContaining({
+            rc_document: expect.objectContaining({ media_id: "media-1" }),
+            vehicleDetails: null,
+            rc_ocr: { status: "failed", needs_review: true },
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("requires a fresh confirmation after correction and ignores old buttons", async () => {
+    await dispatch(rc);
+    const first = h.sendButtons.mock.calls.at(-1)![0];
+    await dispatch({
+      kind: "interactive_reply",
+      reply_title: "",
+      reply_id: first.buttons[1].id,
+      meta_message_id: "correct",
+    });
+    await dispatch({
+      kind: "interactive_reply",
+      reply_title: "",
+      reply_id: first.buttons[0].id,
+      meta_message_id: "stale",
+    });
+    expect(h.state.updates.some((u) => u.row.status === "handed_off")).toBe(
+      false,
+    );
+    await dispatch({ kind: "text", text: "hello", meta_message_id: "invalid" });
+    expect(h.state.updates.some((u) => u.row.status === "handed_off")).toBe(
+      false,
+    );
+    await dispatch({
+      kind: "text",
+      text: "GJ06AZ8208",
+      meta_message_id: "correct-number",
+    });
+    const second = h.sendButtons.mock.calls.at(-1)![0];
+    expect(second.bodyText).toContain("GJ 06 AZ 8208");
+    expect(second.buttons[0].id).not.toBe(first.buttons[0].id);
+    await dispatch({
+      kind: "interactive_reply",
+      reply_title: "",
+      reply_id: first.buttons[0].id,
+      meta_message_id: "stale-again",
+    });
+    expect(h.state.updates.some((u) => u.row.status === "handed_off")).toBe(
+      false,
+    );
+    await dispatch({
+      kind: "interactive_reply",
+      reply_title: "",
+      reply_id: second.buttons[0].id,
+      meta_message_id: "confirmed-new",
+    });
+    expect(h.state.updates.some((u) => u.row.status === "handed_off")).toBe(
+      true,
+    );
+  });
+
+  it("requires confirmation of a manually typed number after an unreadable upload", async () => {
+    vi.mocked(extractRcDetails).mockResolvedValueOnce({
+      vehicleDetails: null,
+      rc_ocr: { status: "unreadable", needs_review: true },
+    });
+    await dispatch(rc);
+    expect(engineSendText).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("poora registration number"),
+      }),
+    );
+    await dispatch({
+      kind: "text",
+      text: "AN01J8844",
+      meta_message_id: "manual-number",
+    });
+    expect(h.sendButtons.mock.calls.at(-1)![0].bodyText).toContain(
+      "AN 01 J 8844",
+    );
+    expect(h.state.updates.some((u) => u.row.status === "handed_off")).toBe(
+      false,
+    );
+  });
+
+  it("fails safely if the confirmation message cannot be sent", async () => {
+    h.sendButtons.mockRejectedValueOnce(new Error("send failed"));
+    expect(await dispatch(rc)).toMatchObject({ outcome: "no_match" });
+    expect(
+      h.state.updates.some(
+        (u) => u.row.end_reason === "rc_confirmation_send_failed",
+      ),
+    ).toBe(true);
+    expect(h.state.updates.some((u) => u.row.status === "handed_off")).toBe(
+      false,
+    );
+  });
+
+  it("shows and confirms all requested fields after customer corrections", async () => {
+    vi.mocked(extractRcDetails).mockResolvedValueOnce({
+      vehicleDetails: {
+        regNumberParts: ["KA", "51", "AK", "9051"],
+        manufacturingDate: "09-2024",
+        registrationDate: "02-01-2025",
+        purchaseDate: null,
+        vehicleType: "pcv",
+        subType: null,
+      },
+      rc_ocr: {
+        status: "extracted",
+        needs_review: true,
+        source: "gemini",
+        model: "gemini-3.5-flash-lite",
+        format_corrected: false,
+      },
+    });
+    await dispatch(rc);
+    const first = h.sendButtons.mock.calls.at(-1)![0];
+    expect(first.bodyText).toContain("09-2024");
+    expect(first.bodyText).toContain("02-01-2025");
+    expect(first.bodyText).toContain("Purchase (DD-MM-YYYY): Not available");
+    expect(first.bodyText).toContain("Passenger Carrier (PCV)");
+    expect(first.bodyText.length).toBeLessThanOrEqual(1024);
+    await dispatch({
+      kind: "interactive_reply",
+      reply_id: first.buttons[1].id,
+      reply_title: "Correct details",
+      meta_message_id: "edit-all",
+    });
+    await dispatch({
+      kind: "text",
+      text: "purchase: 31-02-2025",
+      meta_message_id: "invalid-date",
+    });
+    expect(h.state.updates.some((u) => u.row.status === "handed_off")).toBe(
+      false,
+    );
+    await dispatch({
+      kind: "text",
+      text: "purchase: 01-01-2025\nsubtype: C1A",
+      meta_message_id: "valid-details",
+    });
+    const updated = h.sendButtons.mock.calls.at(-1)![0];
+    expect(updated.bodyText).toContain("Purchase (DD-MM-YYYY): 01-01-2025");
+    expect(updated.bodyText).toContain("C1A - 4W, up to 6 passengers");
+    expect(updated.bodyText).toContain("09-2024");
+    await dispatch({
+      kind: "interactive_reply",
+      reply_id: first.buttons[0].id,
+      reply_title: "Confirm",
+      meta_message_id: "stale-details",
+    });
+    expect(h.state.updates.some((u) => u.row.status === "handed_off")).toBe(
+      false,
+    );
+    await dispatch({
+      kind: "interactive_reply",
+      reply_id: updated.buttons[0].id,
+      reply_title: "Confirm",
+      meta_message_id: "all-confirmed",
+    });
+    expect(h.state.updates.some((u) => u.row.status === "handed_off")).toBe(
+      true,
+    );
+    expect(h.state.activeRuns[0].vars).toMatchObject({
+      vehicleDetails: {
+        purchaseDate: "01-01-2025",
+        subType: "C1A",
+        manufacturingDate: "09-2024",
+      },
+      rc_confirmation: {
+        status: "confirmed",
+        confirmed_message_id: "all-confirmed",
+      },
+    });
   });
 
   it("routes New Quote from the menu to the upload prompt", async () => {
     h.state.activeRuns = [{ ...RUN, current_node_key: "menu", vars: {} }];
-    expect(await dispatch({ kind: "interactive_reply", reply_id: "b2b_new_quote", reply_title: "New Quote", meta_message_id: "new-quote" })).toMatchObject({ outcome: "advanced" });
-    expect(engineSendText).toHaveBeenCalledWith(expect.objectContaining({ text: expect.stringContaining("vehicle RC ki clear photo") }));
+    expect(
+      await dispatch({
+        kind: "interactive_reply",
+        reply_id: "b2b_new_quote",
+        reply_title: "New Quote",
+        meta_message_id: "new-quote",
+      }),
+    ).toMatchObject({ outcome: "advanced" });
+    expect(engineSendText).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("vehicle RC ki clear photo"),
+      }),
+    );
   });
 
   it("routes Help to the team without requiring an upload", async () => {
     h.state.activeRuns = [{ ...RUN, current_node_key: "menu", vars: {} }];
-    expect(await dispatch({ kind: "interactive_reply", reply_id: "b2b_help", reply_title: "Help", meta_message_id: "help" })).toMatchObject({ outcome: "handed_off" });
-    expect(engineSendText).toHaveBeenCalledWith(expect.objectContaining({ text: expect.stringContaining("Team se connect") }));
+    expect(
+      await dispatch({
+        kind: "interactive_reply",
+        reply_id: "b2b_help",
+        reply_title: "Help",
+        meta_message_id: "help",
+      }),
+    ).toMatchObject({ outcome: "handed_off" });
+    expect(engineSendText).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("Team se connect"),
+      }),
+    );
   });
 });

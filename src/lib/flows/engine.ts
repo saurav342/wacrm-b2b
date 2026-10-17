@@ -32,7 +32,17 @@
  *     INSERT raises 23505 and the runner catches & exits.
  */
 
+import { randomUUID } from "node:crypto";
+import { type RegistrationParts } from "./rc-registration";
+import {
+  normalizeDetails,
+  detailsSummary,
+  correctionPrompt,
+  correctDetails,
+} from "./rc-details";
 import { captureInput } from "./capture-input";
+import { extractRcDetails } from "./rc-extraction";
+import { describeFlowSendError } from "./send-error";
 import { supabaseAdmin } from "./admin-client";
 import {
   engineSendInteractiveButtons,
@@ -101,11 +111,13 @@ export function matchesKeywordTrigger(
 ): boolean {
   if (!text || !cfg.keywords?.length) return false;
   const matchType = cfg.match_type ?? "contains";
-  const haystack = cfg.case_sensitive ? text : text.toLowerCase();
+  const haystack = cfg.case_sensitive ? text.trim() : text.trim().toLowerCase();
   for (const raw of cfg.keywords) {
-    if (!raw) continue;
-    const needle = cfg.case_sensitive ? raw : raw.toLowerCase();
-    if (matchType === "exact" ? haystack === needle : haystack.includes(needle)) {
+    if (!raw?.trim()) continue;
+    const needle = cfg.case_sensitive ? raw.trim() : raw.trim().toLowerCase();
+    if (
+      matchType === "exact" ? haystack === needle : haystack.includes(needle)
+    ) {
       return true;
     }
   }
@@ -368,7 +380,10 @@ async function findEntryFlow(
       if (candidates.some((text) => matchesKeywordTrigger(text, cfg))) {
         return flow;
       }
-    } else if (flow.trigger_type === "first_inbound_message" && isFirstInbound) {
+    } else if (
+      flow.trigger_type === "first_inbound_message" &&
+      isFirstInbound
+    ) {
       // Also reachable by a tap now: a broadcast template with a
       // quick-reply button can genuinely be what prompts a contact's
       // first-ever inbound. The automations dispatcher has always
@@ -522,7 +537,8 @@ async function evaluateConditionNode(
   let subjectValue: string | undefined;
   if (cfg.subject === "var") {
     const v = run.vars[cfg.subject_key];
-    subjectValue = typeof v === "string" ? v : v === undefined ? undefined : String(v);
+    subjectValue =
+      typeof v === "string" ? v : v === undefined ? undefined : String(v);
   } else if (cfg.subject === "tag") {
     const { count } = await db
       .from("contact_tags")
@@ -561,7 +577,10 @@ async function evaluateConditionNode(
  * ("Thanks {{vars.name}}, what's your email?"). Missing vars render as
  * empty string — the same behavior as the automations engine.
  */
-function interpolateVars(template: string, vars: Record<string, unknown>): string {
+function interpolateVars(
+  template: string,
+  vars: Record<string, unknown>,
+): string {
   if (!template) return "";
   return template.replace(/\{\{vars\.([a-zA-Z0-9_]+)\}\}/g, (_, key) => {
     const v = vars[key];
@@ -647,7 +666,7 @@ async function advanceFromNodeKey(
       try {
         const { whatsapp_message_id } = await engineSendText({
           accountId: run.account_id,
-    userId: run.user_id,
+          userId: run.user_id,
           conversationId: run.conversation_id!,
           contactId: run.contact_id!,
           text: interpolateVars(cfg.text, run.vars),
@@ -659,7 +678,7 @@ async function advanceFromNodeKey(
       } catch (err) {
         await logEvent(db, run.id, "error", node.node_key, {
           reason: "send_text_failed",
-          detail: err instanceof Error ? err.message : String(err),
+          ...describeFlowSendError(err),
         });
         await endRun(db, run.id, "failed", "send_text_failed");
         return { outcome: "completed" };
@@ -672,7 +691,7 @@ async function advanceFromNodeKey(
       try {
         const { whatsapp_message_id } = await engineSendMedia({
           accountId: run.account_id,
-    userId: run.user_id,
+          userId: run.user_id,
           conversationId: run.conversation_id!,
           contactId: run.contact_id!,
           kind: cfg.media_type,
@@ -690,7 +709,7 @@ async function advanceFromNodeKey(
       } catch (err) {
         await logEvent(db, run.id, "error", node.node_key, {
           reason: "send_media_failed",
-          detail: err instanceof Error ? err.message : String(err),
+          ...describeFlowSendError(err),
         });
         await endRun(db, run.id, "failed", "send_media_failed");
         return { outcome: "completed" };
@@ -705,7 +724,7 @@ async function advanceFromNodeKey(
       try {
         const { whatsapp_message_id } = await engineSendText({
           accountId: run.account_id,
-    userId: run.user_id,
+          userId: run.user_id,
           conversationId: run.conversation_id!,
           contactId: run.contact_id!,
           text: interpolateVars(cfg.prompt_text, run.vars),
@@ -728,7 +747,7 @@ async function advanceFromNodeKey(
       } catch (err) {
         await logEvent(db, run.id, "error", node.node_key, {
           reason: "collect_input_prompt_failed",
-          detail: err instanceof Error ? err.message : String(err),
+          ...describeFlowSendError(err),
         });
         await endRun(db, run.id, "failed", "collect_input_prompt_failed");
         return { outcome: "completed" };
@@ -750,9 +769,7 @@ async function advanceFromNodeKey(
       const cfg = node.config as unknown as ConditionNodeConfig;
       let branch: "true" | "false";
       try {
-        branch = (await evaluateConditionNode(db, run, cfg))
-          ? "true"
-          : "false";
+        branch = (await evaluateConditionNode(db, run, cfg)) ? "true" : "false";
       } catch (err) {
         await logEvent(db, run.id, "error", node.node_key, {
           reason: "condition_evaluation_failed",
@@ -761,8 +778,7 @@ async function advanceFromNodeKey(
         await endRun(db, run.id, "failed", "condition_evaluation_failed");
         return { outcome: "completed" };
       }
-      currentKey =
-        branch === "true" ? cfg.true_next : cfg.false_next;
+      currentKey = branch === "true" ? cfg.true_next : cfg.false_next;
       await logEvent(db, run.id, "node_entered", node.node_key, {
         condition_result: branch,
         advancing_to: currentKey,
@@ -814,7 +830,7 @@ async function advanceFromNodeKey(
       } catch (err) {
         await logEvent(db, run.id, "error", node.node_key, {
           reason: "send_buttons_failed",
-          detail: err instanceof Error ? err.message : String(err),
+          ...describeFlowSendError(err),
         });
         await endRun(db, run.id, "failed", "send_buttons_failed");
         return { outcome: "completed" };
@@ -839,7 +855,7 @@ async function advanceFromNodeKey(
       } catch (err) {
         await logEvent(db, run.id, "error", node.node_key, {
           reason: "send_list_failed",
-          detail: err instanceof Error ? err.message : String(err),
+          ...describeFlowSendError(err),
         });
         await endRun(db, run.id, "failed", "send_list_failed");
         return { outcome: "completed" };
@@ -975,6 +991,153 @@ export async function dispatchInboundToFlows(
   }
 }
 
+type RcConfirmation = {
+  node_key: string;
+  status:
+    | "awaiting_confirmation"
+    | "awaiting_number"
+    | "awaiting_details"
+    | "confirmed";
+  token: string;
+  regNumberParts: RegistrationParts | null;
+  confirmed_message_id?: string;
+};
+
+/** RC collection stays on its existing node until the customer confirms. */
+async function handleRcConfirmation(
+  db: AdminClient,
+  run: FlowRunRow,
+  node: FlowNodeRow,
+  cfg: CollectInputNodeConfig,
+  message: ParsedInbound,
+  nodes: Map<string, FlowNodeRow>,
+): Promise<DispatchInboundResult | null> {
+  const captured = captureInput(cfg, message);
+  const previous = run.vars.rc_confirmation as RcConfirmation | undefined;
+  let state = previous?.node_key === node.node_key ? previous : undefined;
+  let vars = { ...run.vars };
+  let details = normalizeDetails(vars.vehicleDetails);
+  let editError = false;
+  let confirmed = false;
+  if (captured !== null && cfg.var_key) {
+    const extraction = await extractRcDetails(run.account_id, message);
+    details = normalizeDetails(extraction.vehicleDetails);
+    const parts = details.regNumberParts;
+    vars = { ...vars, [cfg.var_key]: captured, ...extraction };
+    state = {
+      node_key: node.node_key,
+      token: randomUUID(),
+      status: parts ? "awaiting_confirmation" : "awaiting_number",
+      regNumberParts: parts,
+    };
+  } else if (!state) {
+    return null; // Before an RC upload, retain the usual upload validation.
+  } else if (
+    message.kind === "interactive_reply" &&
+    state.status === "awaiting_confirmation" &&
+    state.regNumberParts &&
+    message.reply_id === `rc_confirm:${state.token}`
+  ) {
+    state = {
+      ...state,
+      status: "confirmed",
+      confirmed_message_id: message.meta_message_id,
+    };
+    confirmed = true;
+  } else if (
+    message.kind === "interactive_reply" &&
+    message.reply_id === `rc_correct:${state.token}`
+  ) {
+    state = {
+      ...state,
+      status: "awaiting_details",
+      token: randomUUID(),
+    };
+  } else if (message.kind === "text") {
+    const corrected = correctDetails(details, message.text);
+    if (corrected) {
+      details = corrected;
+      state = {
+        node_key: node.node_key,
+        status: details.regNumberParts
+          ? "awaiting_confirmation"
+          : "awaiting_number",
+        token: randomUUID(),
+        regNumberParts: details.regNumberParts,
+      };
+    } else {
+      editError = true;
+    }
+  }
+  // Keep unreadable uploads null until at least one field can be populated.
+  vars.vehicleDetails = Object.values(details).some((v) => v !== null)
+    ? details
+    : null;
+  vars.rc_confirmation = state;
+  const { data, error } = await db
+    .from("flow_runs")
+    .update({ vars, reprompt_count: 0 })
+    .eq("id", run.id)
+    .eq("status", "active")
+    .eq("current_node_key", node.node_key)
+    .eq("vars", JSON.stringify(run.vars)) // Reject concurrent replies based on stale confirmation state.
+    .select("id");
+  if (error || !data?.length) {
+    return { consumed: true, flow_run_id: run.id, outcome: "no_match" };
+  }
+  run.vars = vars;
+  run.reprompt_count = 0;
+  if (confirmed) {
+    await logEvent(db, run.id, "node_entered", node.node_key, {
+      rc_confirmed: true,
+    });
+    const outcome = await advanceFromNodeKey(db, run, cfg.next_node_key, nodes);
+    return { consumed: true, flow_run_id: run.id, outcome: outcome.outcome };
+  }
+  try {
+    if (state.status === "awaiting_confirmation" && state.regNumberParts) {
+      await sendButtonsAndSuspend(db, run, {
+        ...node,
+        config: {
+          text: `${detailsSummary(details)}\n\n${editError ? "Reply samajh nahi aaya. Correct details choose karein. " : ""}Sab details check karein. Missing fields add karne ke liye Correct details choose karein. Confirm & proceed se displayed details (including unknown fields) confirm honge.`,
+          buttons: [
+            {
+              reply_id: `rc_confirm:${state.token}`,
+              title: "Confirm & proceed",
+              next_node_key: cfg.next_node_key,
+            },
+            {
+              reply_id: `rc_correct:${state.token}`,
+              title: "Correct details",
+              next_node_key: node.node_key,
+            },
+          ],
+        },
+      });
+    } else {
+      const sent = await engineSendText({
+        accountId: run.account_id,
+        userId: run.user_id,
+        conversationId: run.conversation_id!,
+        contactId: run.contact_id!,
+        text: `${detailsSummary(details)}\n\n${editError ? "Invalid reply/date. Kripya neeche diya format use karein.\n" : ""}${state.status === "awaiting_details" ? correctionPrompt(details) : "Kripya poora registration number type karein (jaise GJ06AZ8208), ya clearer RC photo bhejein. Baaki fields ke liye:\n" + correctionPrompt(details)}`,
+      });
+      await logEvent(db, run.id, "message_sent", node.node_key, {
+        node_type: "collect_input",
+        whatsapp_message_id: sent.whatsapp_message_id,
+      });
+    }
+  } catch (err) {
+    await logEvent(db, run.id, "error", node.node_key, {
+      reason: "rc_confirmation_send_failed",
+      ...describeFlowSendError(err),
+    });
+    await endRun(db, run.id, "failed", "rc_confirmation_send_failed");
+    return { consumed: true, flow_run_id: run.id, outcome: "no_match" };
+  }
+  return { consumed: true, flow_run_id: run.id, outcome: "advanced" };
+}
+
 async function handleReplyForActiveRun(
   db: AdminClient,
   run: FlowRunRow,
@@ -1026,10 +1189,25 @@ async function handleReplyForActiveRun(
     matched = matchReplyId(currentNode, message.reply_id);
   } else if (currentNode.node_type === "collect_input") {
     const cfg = currentNode.config as unknown as CollectInputNodeConfig;
+    if (cfg.input_type === "rc_document") {
+      const result = await handleRcConfirmation(
+        db,
+        run,
+        currentNode,
+        cfg,
+        message,
+        nodes,
+      );
+      if (result) return result;
+    }
     const captured = captureInput(cfg, message);
     if (captured !== null && cfg.var_key) {
       // Persist captured value + reset reprompt count atomically.
-      const newVars = { ...run.vars, [cfg.var_key]: captured };
+      const extraction =
+        cfg.input_type === "rc_document"
+          ? await extractRcDetails(run.account_id, message)
+          : {};
+      const newVars = { ...run.vars, [cfg.var_key]: captured, ...extraction };
       const { error: capErr } = await db
         .from("flow_runs")
         .update({
@@ -1045,7 +1223,8 @@ async function handleReplyForActiveRun(
         run.reprompt_count = 0;
         await logEvent(db, run.id, "node_entered", currentNode.node_key, {
           captured_key: cfg.var_key,
-          captured_length: typeof captured === "string" ? captured.length : null,
+          captured_length:
+            typeof captured === "string" ? captured.length : null,
           input_type: cfg.input_type ?? "text",
         });
         matched = cfg.next_node_key;
@@ -1121,7 +1300,7 @@ async function handleReplyForActiveRun(
     } catch (err) {
       await logEvent(db, run.id, "error", currentNode.node_key, {
         reason: "reprompt_send_failed",
-        detail: err instanceof Error ? err.message : String(err),
+        ...describeFlowSendError(err),
       });
     }
     return { consumed: true, flow_run_id: run.id, outcome: "fallback_fired" };
